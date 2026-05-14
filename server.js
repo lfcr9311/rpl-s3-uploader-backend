@@ -12,16 +12,22 @@ const { Pool } = pg
 const app = express()
 
 const PORT = Number(process.env.PORT || 8010)
-const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5174"
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://rpl-s3-uploader-frontend.vercel.app"
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5433/postgres"
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 100)
 
 const pool = new Pool({
-  connectionString: DATABASE_URL
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("localhost")
+    ? false
+    : {
+        rejectUnauthorized: false
+      }
 })
 
 const allowedOrigins = [
   FRONTEND_ORIGIN,
+  "https://rpl-s3-uploader-frontend.vercel.app",
   "http://localhost:5173",
   "http://localhost:5174",
   "http://localhost:5175",
@@ -36,6 +42,10 @@ function isAllowedOrigin(origin) {
   }
 
   if (allowedOrigins.includes(origin)) {
+    return true
+  }
+
+  if (/^https:\/\/.+\.vercel\.app$/.test(origin)) {
     return true
   }
 
@@ -389,11 +399,11 @@ async function replaceRplData(input) {
     await client.query("BEGIN")
 
     await client.query(`
-  TRUNCATE TABLE
-    rpl_import_control,
-    rpl_flight
-  RESTART IDENTITY CASCADE
-`)
+      TRUNCATE TABLE
+        rpl_import_control,
+        rpl_flight
+      RESTART IDENTITY CASCADE
+    `)
 
     await client.query(
       `
@@ -493,7 +503,8 @@ app.get("/", (_req, res) => {
     ok: true,
     service: "rpl-postgres-uploader-backend",
     database: "postgres",
-    frontendOrigin: FRONTEND_ORIGIN
+    frontendOrigin: FRONTEND_ORIGIN,
+    allowedOrigins
   })
 })
 
@@ -635,7 +646,6 @@ async function start() {
 
     app.listen(PORT, "0.0.0.0", () => {
       console.log(`Backend rodando em http://localhost:${PORT}`)
-      console.log(`Banco: ${DATABASE_URL}`)
       console.log(`Frontend liberado: ${FRONTEND_ORIGIN}`)
     })
   } catch (error) {
