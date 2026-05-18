@@ -4,6 +4,8 @@ import dotenv from "dotenv"
 import multer from "multer"
 import pg from "pg"
 import crypto from "node:crypto"
+import bcrypt from "bcryptjs"
+import jwt from "jsonwebtoken"
 
 dotenv.config()
 
@@ -15,6 +17,8 @@ const PORT = Number(process.env.PORT || 8010)
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://rpl-s3-uploader-frontend.vercel.app"
 const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5433/postgres"
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 100)
+const JWT_SECRET = process.env.JWT_SECRET || "troque-essa-chave"
+const APP_PASSWORD_HASH = process.env.APP_PASSWORD_HASH || ""
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -98,6 +102,52 @@ const upload = multer({
 app.use(cors(corsOptions))
 app.options(/.*/, cors(corsOptions))
 app.use(express.json({ limit: "10mb" }))
+
+function createToken() {
+  return jwt.sign(
+    {
+      role: "admin"
+    },
+    JWT_SECRET,
+    {
+      expiresIn: "12h"
+    }
+  )
+}
+
+function requireAuth(req, res, next) {
+  const authorization = String(req.headers.authorization || "")
+
+  if (!authorization.startsWith("Bearer ")) {
+    return res.status(401).json({
+      ok: false,
+      error: "Token ausente"
+    })
+  }
+
+  const token = authorization.replace("Bearer ", "").trim()
+
+  try {
+    req.user = jwt.verify(token, JWT_SECRET)
+    return next()
+  } catch {
+    return res.status(401).json({
+      ok: false,
+      error: "Token inválido ou expirado"
+    })
+  }
+}
+
+async function getPasswordHash() {
+  const result = await pool.query(`
+    SELECT password_hash
+    FROM app_auth_password
+    WHERE id = 'main'
+    LIMIT 1
+  `)
+
+  return result.rows[0]?.password_hash || ""
+}
 
 function splitCsvLine(line, delimiter = ";") {
   const result = []
@@ -333,6 +383,30 @@ function parseCsv(buffer) {
 
 async function ensureTables() {
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_auth_password (
+      id TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `)
+
+  if (APP_PASSWORD_HASH) {
+    await pool.query(
+      `
+        INSERT INTO app_auth_password (
+          id,
+          password_hash
+        )
+        VALUES ($1, $2)
+        ON CONFLICT (id)
+        DO NOTHING
+      `,
+      ["main", APP_PASSWORD_HASH]
+    )
+  }
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS rpl_import_control (
       id UUID PRIMARY KEY,
       filename TEXT,
@@ -508,7 +582,47 @@ app.get("/", (_req, res) => {
   })
 })
 
-app.get("/api/status", async (_req, res) => {
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const password = String(req.body?.password || "")
+    const passwordHash = await getPasswordHash()
+
+    if (!passwordHash) {
+      return res.status(500).json({
+        ok: false,
+        error: "Senha da aplicação não configurada"
+      })
+    }
+
+    const valid = await bcrypt.compare(password, passwordHash)
+
+    if (!valid) {
+      return res.status(401).json({
+        ok: false,
+        error: "Senha inválida"
+      })
+    }
+
+    res.json({
+      ok: true,
+      token: createToken()
+    })
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message
+    })
+  }
+})
+
+app.get("/api/auth/me", requireAuth, (_req, res) => {
+  res.json({
+    ok: true,
+    authenticated: true
+  })
+})
+
+app.get("/api/status", requireAuth, async (_req, res) => {
   try {
     const importInfo = await pool.query(`
       SELECT
@@ -541,7 +655,7 @@ app.get("/api/status", async (_req, res) => {
   }
 })
 
-app.get("/api/flights", async (req, res) => {
+app.get("/api/flights", requireAuth, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 1000), 50000)
 
@@ -589,7 +703,7 @@ app.get("/api/flights", async (req, res) => {
   }
 })
 
-app.post("/api/upload", upload.single("file"), async (req, res) => {
+app.post("/api/upload", requireAuth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
