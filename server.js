@@ -2,32 +2,141 @@ import express from "express"
 import cors from "cors"
 import dotenv from "dotenv"
 import multer from "multer"
-import pg from "pg"
 import crypto from "node:crypto"
-import bcrypt from "bcryptjs"
-import jwt from "jsonwebtoken"
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3"
 
 dotenv.config()
-
-const { Pool } = pg
 
 const app = express()
 
 const PORT = Number(process.env.PORT || 8010)
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "https://rpl-s3-uploader-frontend.vercel.app"
-const DATABASE_URL = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5433/postgres"
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 100)
-const JWT_SECRET = process.env.JWT_SECRET || "troque-essa-chave"
-const APP_PASSWORD_HASH = process.env.APP_PASSWORD_HASH || ""
 
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes("localhost")
-    ? false
-    : {
-        rejectUnauthorized: false
+const MINIO_ENDPOINT = (process.env.MINIO_ENDPOINT || "http://3.137.219.87:9000").replace(/\/+$/, "")
+const MINIO_BUCKET = process.env.MINIO_BUCKET || "rotas"
+const MINIO_REGION = process.env.MINIO_REGION || "us-east-1"
+const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || ""
+const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY || ""
+
+// Chave fixa: cada upload sobrescreve o arquivo anterior
+const MINIO_KEY = (process.env.MINIO_KEY || "rpl/rpl.csv").replace(/^\/+/, "")
+const CACHE_TTL_MS = Number(process.env.CACHE_TTL_SECONDS || 60) * 1000
+
+const MINIO_OBJECT_URL = `${MINIO_ENDPOINT}/${[MINIO_BUCKET, ...MINIO_KEY.split("/")]
+  .map(encodeURIComponent)
+  .join("/")}`
+
+// Com chaves usa requisições assinadas; sem chaves usa acesso anônimo (bucket público)
+const s3 =
+  MINIO_ACCESS_KEY && MINIO_SECRET_KEY
+    ? new S3Client({
+        endpoint: MINIO_ENDPOINT,
+        region: MINIO_REGION,
+        forcePathStyle: true,
+        credentials: {
+          accessKeyId: MINIO_ACCESS_KEY,
+          secretAccessKey: MINIO_SECRET_KEY
+        }
+      })
+    : null
+
+async function minioPut(buffer, filename) {
+  const encodedName = encodeURIComponent(filename || "rpl.csv")
+
+  try {
+    if (s3) {
+      await s3.send(
+        new PutObjectCommand({
+          Bucket: MINIO_BUCKET,
+          Key: MINIO_KEY,
+          Body: buffer,
+          ContentType: "text/csv",
+          ContentLength: buffer.length,
+          Metadata: {
+            filename: encodedName
+          }
+        })
+      )
+      return
+    }
+
+    const response = await fetch(MINIO_OBJECT_URL, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "text/csv",
+        "x-amz-meta-filename": encodedName
+      },
+      body: buffer
+    })
+
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 300)
+
+      throw new Error(`HTTP ${response.status} ${detail}`)
+    }
+  } catch (error) {
+    throw new Error(`Falha ao enviar para o MinIO: ${error.message || error.name}`)
+  }
+}
+
+function decodeFilename(value) {
+  try {
+    return decodeURIComponent(value || "")
+  } catch {
+    return String(value || "")
+  }
+}
+
+// Retorna null quando ainda não existe arquivo no bucket
+async function minioGet() {
+  try {
+    if (s3) {
+      try {
+        const object = await s3.send(
+          new GetObjectCommand({
+            Bucket: MINIO_BUCKET,
+            Key: MINIO_KEY
+          })
+        )
+
+        return {
+          buffer: Buffer.from(await object.Body.transformToByteArray()),
+          filename: decodeFilename(object.Metadata?.filename),
+          lastModified: object.LastModified || null
+        }
+      } catch (error) {
+        if (error.name === "NoSuchKey" || error.$metadata?.httpStatusCode === 404) {
+          return null
+        }
+
+        throw error
       }
-})
+    }
+
+    const response = await fetch(MINIO_OBJECT_URL)
+
+    if (response.status === 404) {
+      return null
+    }
+
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 300)
+
+      throw new Error(`HTTP ${response.status} ${detail}`)
+    }
+
+    const lastModified = response.headers.get("last-modified")
+
+    return {
+      buffer: Buffer.from(await response.arrayBuffer()),
+      filename: decodeFilename(response.headers.get("x-amz-meta-filename")),
+      lastModified: lastModified ? new Date(lastModified) : null
+    }
+  } catch (error) {
+    throw new Error(`Falha ao ler do MinIO: ${error.message || error.name}`)
+  }
+}
 
 const allowedOrigins = [
   FRONTEND_ORIGIN,
@@ -70,11 +179,9 @@ function isAllowedOrigin(origin) {
 
 const corsOptions = {
   origin(origin, callback) {
-    if (isAllowedOrigin(origin)) {
-      return callback(null, true)
-    }
-
-    return callback(new Error(`CORS bloqueado para origem: ${origin}`))
+    // Origem não liberada fica sem os headers de CORS (o navegador bloqueia);
+    // chamadas de mesma origem, via proxy em /rpl, continuam funcionando
+    return callback(null, isAllowedOrigin(origin))
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin"],
@@ -102,52 +209,6 @@ const upload = multer({
 app.use(cors(corsOptions))
 app.options(/.*/, cors(corsOptions))
 app.use(express.json({ limit: "10mb" }))
-
-function createToken() {
-  return jwt.sign(
-    {
-      role: "admin"
-    },
-    JWT_SECRET,
-    {
-      expiresIn: "12h"
-    }
-  )
-}
-
-function requireAuth(req, res, next) {
-  const authorization = String(req.headers.authorization || "")
-
-  if (!authorization.startsWith("Bearer ")) {
-    return res.status(401).json({
-      ok: false,
-      error: "Token ausente"
-    })
-  }
-
-  const token = authorization.replace("Bearer ", "").trim()
-
-  try {
-    req.user = jwt.verify(token, JWT_SECRET)
-    return next()
-  } catch {
-    return res.status(401).json({
-      ok: false,
-      error: "Token inválido ou expirado"
-    })
-  }
-}
-
-async function getPasswordHash() {
-  const result = await pool.query(`
-    SELECT password_hash
-    FROM app_auth_password
-    WHERE id = 'main'
-    LIMIT 1
-  `)
-
-  return result.rows[0]?.password_hash || ""
-}
 
 function splitCsvLine(line, delimiter = ";") {
   const result = []
@@ -381,231 +442,90 @@ function parseCsv(buffer) {
   }
 }
 
-async function ensureTables() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_auth_password (
-      id TEXT PRIMARY KEY,
-      password_hash TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-
-  if (APP_PASSWORD_HASH) {
-    await pool.query(
-      `
-        INSERT INTO app_auth_password (
-          id,
-          password_hash
-        )
-        VALUES ($1, $2)
-        ON CONFLICT (id)
-        DO NOTHING
-      `,
-      ["main", APP_PASSWORD_HASH]
-    )
-  }
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS rpl_import_control (
-      id UUID PRIMARY KEY,
-      filename TEXT,
-      total_lines INTEGER NOT NULL DEFAULT 0,
-      total_flights INTEGER NOT NULL DEFAULT 0,
-      total_ignored INTEGER NOT NULL DEFAULT 0,
-      imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS rpl_flight (
-      id UUID PRIMARY KEY,
-
-      flight_number TEXT NOT NULL,
-      equipment TEXT,
-
-      start_date DATE,
-      end_date DATE,
-
-      is_monday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_tuesday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_wednesday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_thursday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_friday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_saturday BOOLEAN NOT NULL DEFAULT FALSE,
-      is_sunday BOOLEAN NOT NULL DEFAULT FALSE,
-
-      departure TEXT NOT NULL,
-      arrival TEXT NOT NULL,
-
-      eobt TEXT,
-      speed TEXT,
-      flight_level TEXT,
-      route TEXT,
-      eet TEXT,
-      remarks TEXT,
-
-      original_line TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `)
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_rpl_flight_flight_number
-    ON rpl_flight(flight_number)
-  `)
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_rpl_flight_departure_arrival
-    ON rpl_flight(departure, arrival)
-  `)
-
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_rpl_flight_eobt
-    ON rpl_flight(eobt)
-  `)
+function compareText(a, b) {
+  return String(a || "").localeCompare(String(b || ""))
 }
 
-async function replaceRplData(input) {
-  const client = await pool.connect()
-
-  try {
-    await client.query("BEGIN")
-
-    await client.query(`
-      TRUNCATE TABLE
-        rpl_import_control,
-        rpl_flight
-      RESTART IDENTITY CASCADE
-    `)
-
-    await client.query(
-      `
-        INSERT INTO rpl_import_control (
-          id,
-          filename,
-          total_lines,
-          total_flights,
-          total_ignored
-        )
-        VALUES ($1, $2, $3, $4, $5)
-      `,
-      [
-        crypto.randomUUID(),
-        input.filename,
-        input.totalLines,
-        input.rows.length,
-        input.ignored.length
-      ]
+function buildRplData(parsed, filename, importedAt) {
+  const flights = parsed.rows
+    .map(({ original_line: _originalLine, ...row }) => ({
+      ...row,
+      // Sem fuso: o frontend faz new Date(valor) e precisa cair no dia certo no horário local
+      start_date: row.start_date ? `${row.start_date}T00:00:00` : null,
+      end_date: row.end_date ? `${row.end_date}T00:00:00` : null
+    }))
+    .sort(
+      (a, b) =>
+        compareText(a.flight_number, b.flight_number) ||
+        compareText(a.departure, b.departure) ||
+        compareText(a.arrival, b.arrival) ||
+        compareText(a.eobt, b.eobt)
     )
 
-    const sql = `
-      INSERT INTO rpl_flight (
-        id,
-        flight_number,
-        equipment,
-        start_date,
-        end_date,
-        is_monday,
-        is_tuesday,
-        is_wednesday,
-        is_thursday,
-        is_friday,
-        is_saturday,
-        is_sunday,
-        departure,
-        arrival,
-        eobt,
-        speed,
-        flight_level,
-        route,
-        eet,
-        remarks,
-        original_line
-      )
-      VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $7, $8, $9, $10, $11, $12,
-        $13, $14, $15, $16, $17, $18,
-        $19, $20, $21
-      )
-    `
-
-    for (const row of input.rows) {
-      await client.query(sql, [
-        row.id,
-        row.flight_number,
-        row.equipment || null,
-        row.start_date,
-        row.end_date,
-        row.is_monday,
-        row.is_tuesday,
-        row.is_wednesday,
-        row.is_thursday,
-        row.is_friday,
-        row.is_saturday,
-        row.is_sunday,
-        row.departure,
-        row.arrival,
-        row.eobt || null,
-        row.speed || null,
-        row.flight_level || null,
-        row.route || null,
-        row.eet || null,
-        row.remarks || null,
-        row.original_line || null
-      ])
+  return {
+    flights,
+    lastImport: {
+      filename: filename || MINIO_KEY.split("/").pop(),
+      totalLines: parsed.totalLines,
+      totalFlights: flights.length,
+      totalIgnored: parsed.ignored.length,
+      importedAt: importedAt || new Date()
     }
-
-    await client.query("COMMIT")
-
-    return {
-      totalLines: input.totalLines,
-      totalFlights: input.rows.length,
-      totalIgnored: input.ignored.length
-    }
-  } catch (error) {
-    await client.query("ROLLBACK")
-    throw error
-  } finally {
-    client.release()
   }
 }
+
+let rplCache = null
+
+async function getRplData() {
+  if (rplCache && Date.now() - rplCache.loadedAt < CACHE_TTL_MS) {
+    return rplCache.data
+  }
+
+  const object = await minioGet()
+
+  const data = object
+    ? buildRplData(parseCsv(object.buffer), object.filename, object.lastModified)
+    : {
+        flights: [],
+        lastImport: null
+      }
+
+  rplCache = {
+    loadedAt: Date.now(),
+    data
+  }
+
+  return data
+}
+
+// Usado pelo deploy para conferir se o servidor está no ar
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true
+  })
+})
 
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
-    service: "rpl-postgres-uploader-backend",
-    database: "postgres",
+    service: "rpl-minio-uploader-backend",
+    storage: "minio",
+    bucket: MINIO_BUCKET,
+    key: MINIO_KEY,
     frontendOrigin: FRONTEND_ORIGIN,
     allowedOrigins
   })
 })
 
-app.post("/api/auth/login", async (req, res) => {
+app.get("/api/status", async (_req, res) => {
   try {
-    const password = String(req.body?.password || "")
-    const passwordHash = await getPasswordHash()
-
-    if (!passwordHash) {
-      return res.status(500).json({
-        ok: false,
-        error: "Senha da aplicação não configurada"
-      })
-    }
-
-    const valid = await bcrypt.compare(password, passwordHash)
-
-    if (!valid) {
-      return res.status(401).json({
-        ok: false,
-        error: "Senha inválida"
-      })
-    }
+    const data = await getRplData()
 
     res.json({
       ok: true,
-      token: createToken()
+      storage: true,
+      totalFlights: data.flights.length,
+      lastImport: data.lastImport
     })
   } catch (error) {
     res.status(500).json({
@@ -615,37 +535,16 @@ app.post("/api/auth/login", async (req, res) => {
   }
 })
 
-app.get("/api/auth/me", requireAuth, (_req, res) => {
-  res.json({
-    ok: true,
-    authenticated: true
-  })
-})
-
-app.get("/api/status", requireAuth, async (_req, res) => {
+app.get("/api/flights", async (req, res) => {
   try {
-    const importInfo = await pool.query(`
-      SELECT
-        filename,
-        total_lines AS "totalLines",
-        total_flights AS "totalFlights",
-        total_ignored AS "totalIgnored",
-        imported_at AS "importedAt"
-      FROM rpl_import_control
-      ORDER BY imported_at DESC
-      LIMIT 1
-    `)
-
-    const count = await pool.query(`
-      SELECT COUNT(*)::int AS total
-      FROM rpl_flight
-    `)
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 1000, 50000))
+    const data = await getRplData()
+    const flights = data.flights.slice(0, limit)
 
     res.json({
       ok: true,
-      database: true,
-      totalFlights: count.rows[0]?.total || 0,
-      lastImport: importInfo.rows[0] || null
+      total: flights.length,
+      data: flights
     })
   } catch (error) {
     res.status(500).json({
@@ -655,55 +554,7 @@ app.get("/api/status", requireAuth, async (_req, res) => {
   }
 })
 
-app.get("/api/flights", requireAuth, async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit || 1000), 50000)
-
-    const result = await pool.query(
-      `
-        SELECT
-          id,
-          flight_number,
-          equipment,
-          start_date,
-          end_date,
-          is_monday,
-          is_tuesday,
-          is_wednesday,
-          is_thursday,
-          is_friday,
-          is_saturday,
-          is_sunday,
-          departure,
-          arrival,
-          eobt,
-          speed,
-          flight_level,
-          route,
-          eet,
-          remarks,
-          created_at
-        FROM rpl_flight
-        ORDER BY flight_number, departure, arrival, eobt
-        LIMIT $1
-      `,
-      [limit]
-    )
-
-    res.json({
-      ok: true,
-      total: result.rows.length,
-      data: result.rows
-    })
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    })
-  }
-})
-
-app.post("/api/upload", requireAuth, upload.single("file"), async (req, res) => {
+app.post("/api/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -712,6 +563,8 @@ app.post("/api/upload", requireAuth, upload.single("file"), async (req, res) => 
       })
     }
 
+    // O multer entrega o nome em latin1; converte para manter acentos
+    const filename = Buffer.from(req.file.originalname, "latin1").toString("utf8")
     const parsed = parseCsv(req.file.buffer)
 
     if (parsed.rows.length === 0) {
@@ -724,19 +577,27 @@ app.post("/api/upload", requireAuth, upload.single("file"), async (req, res) => 
       })
     }
 
-    const result = await replaceRplData({
-      filename: req.file.originalname,
-      totalLines: parsed.totalLines,
-      rows: parsed.rows,
-      ignored: parsed.ignored
-    })
+    await minioPut(req.file.buffer, filename)
+
+    const data = buildRplData(parsed, filename, new Date())
+
+    rplCache = {
+      loadedAt: Date.now(),
+      data
+    }
 
     res.json({
       ok: true,
-      message: "CSV importado para o Postgres com sucesso",
-      filename: req.file.originalname,
+      message: "CSV salvo no MinIO com sucesso",
+      filename,
       size: req.file.size,
-      ...result,
+      storage: {
+        bucket: MINIO_BUCKET,
+        key: MINIO_KEY
+      },
+      totalLines: data.lastImport.totalLines,
+      totalFlights: data.lastImport.totalFlights,
+      totalIgnored: data.lastImport.totalIgnored,
       ignoredSample: parsed.ignored.slice(0, 20)
     })
   } catch (error) {
@@ -754,29 +615,11 @@ app.use((error, _req, res, _next) => {
   })
 })
 
-async function start() {
-  try {
-    await ensureTables()
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend rodando em http://localhost:${PORT}`)
+  console.log(`MinIO: ${MINIO_OBJECT_URL} (${s3 ? "com credenciais" : "acesso anônimo"})`)
+})
 
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Backend rodando em http://localhost:${PORT}`)
-      console.log(`Frontend liberado: ${FRONTEND_ORIGIN}`)
-    })
-  } catch (error) {
-    console.error("Erro ao iniciar backend")
-    console.error(error)
-    process.exit(1)
-  }
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => process.exit(0))
 }
-
-process.on("SIGINT", async () => {
-  await pool.end()
-  process.exit(0)
-})
-
-process.on("SIGTERM", async () => {
-  await pool.end()
-  process.exit(0)
-})
-
-start()

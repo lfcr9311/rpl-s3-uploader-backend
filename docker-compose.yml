@@ -1,0 +1,22 @@
+# Backend do RPL. Nao publica porta: o Caddy do frontend (rpl-frontend) repassa
+# /rpl/api/* para rpl-backend:8010 pela rede do Caddy do ~/fortran (fortran_default).
+services:
+  rpl-backend:
+    build: .
+    image: rpl-backend
+    restart: unless-stopped
+    # tudo opcional: vazio = padrao do server.js. Para mudar, crie um .env ao
+    # lado deste arquivo (ver deploy/README.md)
+    environment:
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-}
+      MINIO_BUCKET: ${MINIO_BUCKET:-}
+      MINIO_KEY: ${MINIO_KEY:-}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-}
+    networks: [fortran]
+
+networks:
+  # criada pelo docker compose do ~/fortran (precisa estar no ar antes)
+  fortran:
+    name: fortran_default
+    external: true

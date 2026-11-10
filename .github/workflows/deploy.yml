@@ -1,0 +1,76 @@
+# Deploy automatico: a cada push na main, confere o codigo e entra no EC2 por
+# SSH para rodar deploy/atualizar.sh (git pull + docker compose up --build).
+# A API responde em http://<EC2>/rpl/api (repassada pelo Caddy do frontend).
+# Configuracao (secrets, chave SSH, primeira instalacao): deploy/README.md.
+name: Deploy no EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:          # botao "Run workflow" na aba Actions
+
+# um deploy por vez; um push durante o deploy espera o anterior terminar
+concurrency:
+  group: deploy-ec2-rpl-backend
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: yarn
+      - name: Backend
+        run: |
+          yarn install --frozen-lockfile
+          node --check server.js
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Atualizar o servidor
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          for v in EC2_HOST EC2_USER EC2_SSH_KEY EC2_KNOWN_HOSTS; do
+            [ -n "${!v}" ] || { echo "::error::Falta o secret $v (Settings > Secrets and variables > Actions)"; exit 1; }
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # espaco ou quebra de linha colados junto com o secret
+          EC2_HOST=$(printf '%s' "$EC2_HOST" | tr -d '[:space:]')
+          EC2_USER=$(printf '%s' "$EC2_USER" | tr -d '[:space:]')
+          if ! ssh-keygen -F "$EC2_HOST" -f ~/.ssh/known_hosts | grep -q ssh-ed25519; then
+            echo "::error::EC2_KNOWN_HOSTS nao tem chave ssh-ed25519 para o EC2_HOST"
+            echo "EC2_HOST: ${#EC2_HOST} caracteres; tem '@': $([[ $EC2_HOST == *@* ]] && echo sim || echo nao); tem '://': $([[ $EC2_HOST == *://* ]] && echo sim || echo nao)"
+            echo "EC2_KNOWN_HOSTS: $(grep -c . ~/.ssh/known_hosts) linha(s); hosts e tipos de chave:"
+            awk 'NF && $1 !~ /^#/ {print "  " $1, $2}' ~/.ssh/known_hosts
+            exit 1
+          fi
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=30 -o ConnectTimeout=20 \
+              "$EC2_USER@$EC2_HOST" \
+              "DEPLOY_BRANCH='${{ github.ref_name }}' bash ~/rpl-s3-uploader-backend/deploy/atualizar.sh"
+
+      - name: Conferir /rpl/api
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          EC2_HOST=$(printf '%s' "$EC2_HOST" | tr -d '[:space:]')
+          for _ in $(seq 1 10); do
+            curl -fsS "http://$EC2_HOST/rpl/api/health" && exit 0
+            sleep 3
+          done
+          echo "::error::http://$EC2_HOST/rpl/api/health nao respondeu (o frontend esta no ar? o Caddy do ~/fortran repassa /rpl* para rpl-frontend:80?)"
+          exit 1
